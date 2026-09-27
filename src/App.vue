@@ -34,10 +34,16 @@ const {
   redo,
   exportMarkdown,
   exportJson,
+  exportWorkPackage,
+  importWorkPackage,
   commit
 } = useCollation();
 
 const importVisible = ref(false);
+const packageVisible = ref(false);
+const packageText = ref('');
+const packageForm = ref({ text: '' });
+const packageProblems = ref<string[]>([]);
 const onlyDifferences = ref(false);
 const rowQuery = ref('');
 const noteDraft = ref('');
@@ -126,12 +132,45 @@ function download(filename: string, text: string, type: string) {
   URL.revokeObjectURL(url);
 }
 
-function handleExport(kind: 'markdown' | 'json') {
+function handleExport(kind: 'markdown' | 'json' | 'package') {
   if (kind === 'markdown') {
     download('校勘记.md', exportMarkdown(), 'text/markdown;charset=utf-8');
-  } else {
+  } else if (kind === 'json') {
     download('校勘数据.json', exportJson(), 'application/json;charset=utf-8');
+  } else {
+    download('校勘工作包.json', exportWorkPackage(), 'application/json;charset=utf-8');
   }
+}
+
+function openPackageImport() {
+  packageText.value = '';
+  packageProblems.value = [];
+  packageVisible.value = true;
+}
+
+function confirmPackageImport() {
+  const raw = packageText.value.trim();
+  if (!raw) {
+    packageProblems.value = ['请粘贴工作包 JSON 或选择工作包文件'];
+    return false;
+  }
+  const result = importWorkPackage(raw);
+  if (!result.ok) {
+    packageProblems.value = result.problems;
+    return false;
+  }
+  packageProblems.value = [];
+  Message.success('工作包已恢复，可继续校勘，也可用撤销撤回本次恢复');
+  return true;
+}
+
+function handlePackageFile(event: Event) {
+  const target = event.target as HTMLInputElement;
+  const file = target.files?.[0];
+  if (!file) return;
+  file.text().then((text) => {
+    packageText.value = text;
+  });
 }
 
 function openImport() {
@@ -207,11 +246,13 @@ window.addEventListener('beforeunload', beforeUnload);
           <a-button :disabled="!canRedo" @click="redo">重做</a-button>
           <a-button type="primary" :loading="processing" @click="runAlignment()">重新自动对齐</a-button>
           <a-button @click="openImport">导入版本</a-button>
+          <a-button @click="openPackageImport">导入工作包</a-button>
           <a-dropdown>
             <a-button>导出校勘记</a-button>
             <template #content>
               <a-doption @click="handleExport('markdown')">Markdown 校勘记</a-doption>
               <a-doption @click="handleExport('json')">JSON 校勘数据</a-doption>
+              <a-doption @click="handleExport('package')">工作包 JSON（可粘贴恢复）</a-doption>
             </template>
           </a-dropdown>
         </a-space>
@@ -487,6 +528,34 @@ window.addEventListener('beforeunload', beforeUnload);
         />
       </a-form-item>
       <a-alert type="info" :show-icon="true">导入仅写入当前浏览器。对齐过程会分片执行，原文不会被自动改写。</a-alert>
+    </a-form>
+  </a-modal>
+
+  <a-modal
+    v-model:visible="packageVisible"
+    title="导入工作包（粘贴恢复）"
+    width="700px"
+    :on-before-ok="confirmPackageImport"
+  >
+    <a-form :model="packageForm" layout="vertical">
+      <a-form-item label="选择工作包文件">
+        <input type="file" accept=".json,application/json" @change="handlePackageFile" />
+      </a-form-item>
+      <a-form-item label="或粘贴工作包 JSON">
+        <a-textarea
+          v-model="packageText"
+          placeholder="粘贴由「导出校勘记 → 工作包 JSON」生成的内容，包含版本正文、底本参校组合、比较规则和全部对齐行"
+          :auto-size="{ minRows: 8, maxRows: 16 }"
+        />
+      </a-form-item>
+      <a-alert v-if="packageProblems.length" type="error" :show-icon="true" title="工作包校验未通过，当前工作区保持不变">
+        <ul style="margin: 6px 0 0; padding-left: 18px">
+          <li v-for="problem in packageProblems" :key="problem">{{ problem }}</li>
+        </ul>
+      </a-alert>
+      <a-alert v-else type="info" :show-icon="true">
+        恢复前会核对同名版本正文是否一致、底本与参校本是否齐全；对不上会说明原因且不改写当前工作区。恢复成功计入撤销历史，可继续调整或撤回。
+      </a-alert>
     </a-form>
   </a-modal>
 </template>

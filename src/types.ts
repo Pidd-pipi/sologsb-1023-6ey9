@@ -44,3 +44,28 @@ export interface PersistedCollationState {
   rules: ComparisonRules;
   selectedRowId: string;
 }
+
+export interface WorkPackageVersion {
+  id: string;
+  name: string;
+  source: string;
+  createdAt: string;
+  text: string;
+}
+
+export interface WorkPackage {
+  format: string;
+  packageVersion: number;
+  exportedAt: string;
+  versions: WorkPackageVersion[];
+  leftVersionId: string;
+  rightVersionId: string;
+  rules: ComparisonRules;
+  rows: AlignmentRow[];
+  selectedRowId: string;
+}
+
+export interface ImportResult {
+  ok: boolean;
+  problems: string[];
+}

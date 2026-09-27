@@ -4,12 +4,15 @@ import type {
   AlignmentRow,
   ComparisonRules,
   DifferenceStatus,
+  ImportResult,
   PersistedCollationState,
   TextUnit,
-  VersionDocument
+  VersionDocument,
+  WorkPackage
 } from '../types';
 
 const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
+const WORK_PACKAGE_FORMAT = 'sologsb-1023/work-package';
 
 const variantMap: Record<string, string> = {
   為: '为',
@@ -413,6 +416,92 @@ export function useCollation() {
     );
   }
 
+  function exportWorkPackage() {
+    const pkg: WorkPackage = {
+      format: WORK_PACKAGE_FORMAT,
+      packageVersion: 1,
+      exportedAt: new Date().toISOString(),
+      versions: versions.value.map(({ id, name, source, createdAt, text }) => ({ id, name, source, createdAt, text })),
+      leftVersionId: leftVersionId.value,
+      rightVersionId: rightVersionId.value,
+      rules: { ...rules.value },
+      rows: rows.value,
+      selectedRowId: selectedRowId.value
+    };
+    return JSON.stringify(pkg, null, 2);
+  }
+
+  function importWorkPackage(raw: string): ImportResult {
+    let pkg: Partial<WorkPackage>;
+    try {
+      pkg = JSON.parse(raw) as Partial<WorkPackage>;
+    } catch {
+      return { ok: false, problems: ['工作包不是有效的 JSON 文本，请确认粘贴内容完整'] };
+    }
+
+    const problems: string[] = [];
+    if (pkg.format !== WORK_PACKAGE_FORMAT) {
+      problems.push(`缺少工作包标识：format 字段应为 ${WORK_PACKAGE_FORMAT}`);
+    }
+    const incoming = Array.isArray(pkg.versions) ? pkg.versions : [];
+    if (!incoming.length) {
+      problems.push('版本正文缺失：工作包内没有任何版本');
+    }
+    incoming.forEach((item, index) => {
+      if (!item || typeof item.id !== 'string' || typeof item.name !== 'string' || typeof item.text !== 'string') {
+        problems.push(`第 ${index + 1} 个版本缺少 id、名称或正文字段`);
+      }
+    });
+    if (!pkg.leftVersionId) {
+      problems.push('底本缺失：工作包未记录底本');
+    } else if (incoming.length && !incoming.some((item) => item.id === pkg.leftVersionId)) {
+      problems.push(`底本缺失：工作包引用的底本「${pkg.leftVersionId}」不在版本列表中`);
+    }
+    if (!pkg.rightVersionId) {
+      problems.push('参校本缺失：工作包未记录参校本');
+    } else if (incoming.length && !incoming.some((item) => item.id === pkg.rightVersionId)) {
+      problems.push(`参校本缺失：工作包引用的参校本「${pkg.rightVersionId}」不在版本列表中`);
+    }
+    for (const item of incoming) {
+      if (typeof item?.name !== 'string' || typeof item?.text !== 'string') continue;
+      const existing = versions.value.find((version) => version.name === item.name);
+      if (existing && existing.text.trim() !== item.text.trim()) {
+        problems.push(
+          `版本「${item.name}」同名但正文不同：当前工作区 ${existing.units.length} 句，工作包 ${splitIntoUnits(item.text, item.id).length} 句`
+        );
+      }
+    }
+    if (!pkg.rules || typeof pkg.rules !== 'object') {
+      problems.push('比较规则缺失：工作包内没有 rules 字段');
+    }
+    if (!Array.isArray(pkg.rows)) {
+      problems.push('对齐行缺失：工作包内没有 rows 数组');
+    }
+    if (problems.length) return { ok: false, problems };
+
+    const restoredRows = clone(pkg.rows as AlignmentRow[]);
+    commit('已恢复导入的工作包', () => {
+      versions.value = incoming.map((item) => ({
+        id: item.id,
+        name: item.name,
+        source: item.source ?? '',
+        createdAt: item.createdAt ?? new Date().toISOString(),
+        text: item.text,
+        units: splitIntoUnits(item.text, item.id)
+      }));
+      leftVersionId.value = pkg.leftVersionId!;
+      rightVersionId.value = pkg.rightVersionId!;
+      rules.value = { ...defaultRules(), ...pkg.rules };
+      rows.value = restoredRows;
+      selectedRowId.value =
+        typeof pkg.selectedRowId === 'string' && restoredRows.some((row) => row.id === pkg.selectedRowId)
+          ? pkg.selectedRowId
+          : restoredRows.find((row) => row.status !== 'same')?.id ?? restoredRows[0]?.id ?? '';
+      selectedRowIds.value = [];
+    });
+    return { ok: true, problems: [] };
+  }
+
   onMounted(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -470,6 +559,8 @@ export function useCollation() {
     redo,
     exportMarkdown,
     exportJson,
+    exportWorkPackage,
+    importWorkPackage,
     commit
   };
 }
