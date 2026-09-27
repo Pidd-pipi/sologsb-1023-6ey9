@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { Message } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
-import type { AlignmentRow, DifferenceStatus } from './types';
+import type { AlignmentRow, DifferenceStatus, WorkPackageInspection } from './types';
 
 const {
   versions,
@@ -34,6 +34,9 @@ const {
   redo,
   exportMarkdown,
   exportJson,
+  exportWorkPackage,
+  inspectPackage,
+  restoreFromPackage,
   commit
 } = useCollation();
 
@@ -44,6 +47,14 @@ const noteDraft = ref('');
 const sourceDraft = ref('');
 const importForm = ref({ name: '', source: '', text: '' });
 const fileInput = ref<HTMLInputElement | null>(null);
+
+const packageVisible = ref(false);
+const packageTab = ref<'export' | 'import'>('export');
+const packageExportText = ref('');
+const packageImportText = ref('');
+const packageInspection = ref<WorkPackageInspection | null>(null);
+const packageFileInput = ref<HTMLInputElement | null>(null);
+let packageInspectTimer: number | undefined;
 
 const columns = [
   { title: '状态', dataIndex: 'status', slotName: 'status', width: 122, fixed: 'left' as const },
@@ -160,6 +171,72 @@ function handleFile(event: Event) {
   });
 }
 
+const packageErrors = computed(() => packageInspection.value?.issues.filter((issue) => issue.level === 'error') ?? []);
+const packageWarnings = computed(() => packageInspection.value?.issues.filter((issue) => issue.level === 'warning') ?? []);
+
+function openPackage(tab: 'export' | 'import' = 'export') {
+  packageTab.value = tab;
+  packageVisible.value = true;
+  if (tab === 'export') packageExportText.value = exportWorkPackage();
+  if (tab === 'import' && !packageImportText.value) packageInspection.value = null;
+}
+
+function switchPackageTab(key: string | number) {
+  if (key === 'export') packageExportText.value = exportWorkPackage();
+}
+
+async function copyPackage() {
+  try {
+    await navigator.clipboard.writeText(packageExportText.value);
+    Message.success('工作包已复制，可直接粘贴');
+  } catch {
+    Message.warning('浏览器拒绝了剪贴板访问，请手动全选复制');
+  }
+}
+
+function downloadPackage() {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+  download(`校勘工作包-${stamp}.json`, packageExportText.value, 'application/json;charset=utf-8');
+}
+
+function scheduleInspection() {
+  window.clearTimeout(packageInspectTimer);
+  if (!packageImportText.value.trim()) {
+    packageInspection.value = null;
+    return;
+  }
+  packageInspectTimer = window.setTimeout(() => {
+    packageInspection.value = inspectPackage(packageImportText.value);
+  }, 250);
+}
+
+function handlePackageFile(event: Event) {
+  const target = event.target as HTMLInputElement;
+  const file = target.files?.[0];
+  if (!file) return;
+  file.text().then((text) => {
+    packageImportText.value = text;
+    packageInspection.value = inspectPackage(text);
+    Message.success(`已读入文件：${file.name}`);
+  });
+}
+
+function confirmRestore() {
+  const inspection = inspectPackage(packageImportText.value);
+  packageInspection.value = inspection;
+  if (!inspection.ok || !inspection.plan) {
+    Message.error(`校验未通过（${inspection.issues.filter((issue) => issue.level === 'error').length} 项对不上），原工作区保持不变`);
+    return;
+  }
+  restoreFromPackage(inspection.plan);
+  const { summary } = inspection;
+  packageVisible.value = false;
+  Message.success(
+    `工作区已恢复：底本「${summary.baseName}」对参校「${summary.referenceName}」，` +
+      `${summary.rowCount} 条对齐行；如不满意可点撤销回到原工作区`
+  );
+}
+
 function handleKeydown(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null;
   const typing = target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
@@ -207,6 +284,7 @@ window.addEventListener('beforeunload', beforeUnload);
           <a-button :disabled="!canRedo" @click="redo">重做</a-button>
           <a-button type="primary" :loading="processing" @click="runAlignment()">重新自动对齐</a-button>
           <a-button @click="openImport">导入版本</a-button>
+          <a-button type="outline" @click="openPackage('export')">工作包</a-button>
           <a-dropdown>
             <a-button>导出校勘记</a-button>
             <template #content>
@@ -488,5 +566,94 @@ window.addEventListener('beforeunload', beforeUnload);
       </a-form-item>
       <a-alert type="info" :show-icon="true">导入仅写入当前浏览器。对齐过程会分片执行，原文不会被自动改写。</a-alert>
     </a-form>
+  </a-modal>
+
+  <a-modal
+    v-model:visible="packageVisible"
+    title="校勘工作包 · 导出与粘贴恢复"
+    width="760px"
+    :ok-text="packageTab === 'import' ? '校验并恢复' : '完成'"
+    :cancel-text="packageTab === 'import' ? '关闭（保留当前工作区）' : '取消'"
+    :ok-button-props="{ status: packageTab === 'import' ? 'success' : 'normal', type: packageTab === 'import' ? 'primary' : 'secondary' }"
+    @ok="packageTab === 'import' ? confirmRestore() : (packageVisible = false)"
+  >
+    <a-tabs v-model:active-key="packageTab" @change="switchPackageTab">
+      <a-tab-pane key="export" title="导出工作包">
+        <a-alert type="info" :show-icon="true" style="margin-bottom: 12px">
+          工作包自包含全部版本正文、当前底本/参校组合、比较规则和全部对齐行（含校记、来源与接受结果）。整体复制到另一台电脑粘贴即可恢复，无需先导入任何版本。
+        </a-alert>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px">
+          <a-button type="primary" size="small" @click="copyPackage">复制全部内容</a-button>
+          <a-button size="small" @click="downloadPackage">下载为 .json 文件</a-button>
+          <a-button size="small" @click="packageExportText = exportWorkPackage()">重新生成</a-button>
+          <a-tag color="arcoblue" style="margin-left: auto">{{ packageExportText.length }} 字符</a-tag>
+        </div>
+        <a-textarea
+          v-model="packageExportText"
+          readonly
+          :auto-size="{ minRows: 14, maxRows: 18 }"
+          class="package-textarea"
+          aria-label="工作包 JSON 全文"
+        />
+      </a-tab-pane>
+
+      <a-tab-pane key="import" title="粘贴恢复">
+        <a-form :model="{}" layout="vertical">
+          <a-form-item label="粘贴工作包 JSON，或选择工作包文件">
+            <input
+              ref="packageFileInput"
+              type="file"
+              accept=".json,application/json"
+              style="margin-bottom: 8px"
+              @change="handlePackageFile"
+            />
+            <a-textarea
+              v-model="packageImportText"
+              placeholder="粘贴另一台电脑导出的「collation-workpackage」JSON 全文"
+              :auto-size="{ minRows: 10, maxRows: 14 }"
+              class="package-textarea"
+              aria-label="待恢复的工作包 JSON"
+              @input="scheduleInspection"
+            />
+          </a-form-item>
+        </a-form>
+
+        <a-alert v-if="packageInspection && packageErrors.length" type="error" :show-icon="true" style="margin-bottom: 8px">
+          <div style="font-weight: 600; margin-bottom: 4px">
+            校验未通过：{{ packageErrors.length }} 项对不上，已保留原来的工作区，未做任何修改
+          </div>
+          <ul class="issue-list">
+            <li v-for="(issue, index) in packageErrors" :key="`e-${index}`">{{ issue.message }}</li>
+          </ul>
+        </a-alert>
+
+        <a-alert v-if="packageInspection && packageWarnings.length" type="warning" :show-icon="true" style="margin-bottom: 8px">
+          <div style="font-weight: 600; margin-bottom: 4px">{{ packageWarnings.length }} 项提醒（不阻止恢复）</div>
+          <ul class="issue-list">
+            <li v-for="(issue, index) in packageWarnings" :key="`w-${index}`">{{ issue.message }}</li>
+          </ul>
+        </a-alert>
+
+        <a-alert v-if="packageInspection && packageInspection.ok" type="success" :show-icon="true">
+          <div style="font-weight: 600; margin-bottom: 4px">校验通过，可以恢复：</div>
+          <div style="line-height: 1.8">
+            底本「{{ packageInspection.summary.baseName || '未指定' }}」对参校本「{{
+              packageInspection.summary.referenceName || '未指定'
+            }}」；共 {{ packageInspection.summary.versionCount }} 个版本（{{
+              packageInspection.summary.reusedCount
+            }} 个与本地一致、{{ packageInspection.summary.createdCount }} 个将新建）、{{
+              packageInspection.summary.rowCount
+            }} 条对齐行，其中 {{ packageInspection.summary.differenceCount }} 处差异。恢复后可继续调整，也可用撤销退回原工作区。
+          </div>
+        </a-alert>
+
+        <a-alert v-else-if="!packageInspection && packageImportText" type="info" :show-icon="true">
+          正在校验粘贴内容…
+        </a-alert>
+        <a-alert v-else-if="!packageInspection" type="info" :show-icon="true">
+          恢复前会先校验：同名版本正文不同、底本或参校本缺失、对齐行引用的句段不在包内等问题都会逐项列出；任何一项对不上都不会改动当前工作区。
+        </a-alert>
+      </a-tab-pane>
+    </a-tabs>
   </a-modal>
 </template>

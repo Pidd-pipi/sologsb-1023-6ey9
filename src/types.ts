@@ -44,3 +44,49 @@ export interface PersistedCollationState {
   rules: ComparisonRules;
   selectedRowId: string;
 }
+
+export interface WorkPackage {
+  kind: 'collation-workpackage';
+  appVersion: 1;
+  exportedAt: string;
+  versions: VersionDocument[];
+  leftVersionId: string;
+  rightVersionId: string;
+  rules: ComparisonRules;
+  rows: AlignmentRow[];
+  selectedRowId?: string;
+}
+
+export interface WorkPackageIssue {
+  level: 'error' | 'warning';
+  code: string;
+  message: string;
+}
+
+export interface WorkPackageRestorePlan {
+  versions: VersionDocument[];
+  leftVersionId: string;
+  rightVersionId: string;
+  rules: ComparisonRules;
+  rows: AlignmentRow[];
+  selectedRowId: string;
+  reusedVersionIds: string[];
+  createdVersionIds: string[];
+}
+
+export interface WorkPackageInspectionSummary {
+  versionCount: number;
+  rowCount: number;
+  differenceCount: number;
+  baseName: string;
+  referenceName: string;
+  reusedCount: number;
+  createdCount: number;
+}
+
+export interface WorkPackageInspection {
+  ok: boolean;
+  issues: WorkPackageIssue[];
+  summary: WorkPackageInspectionSummary;
+  plan?: WorkPackageRestorePlan;
+}

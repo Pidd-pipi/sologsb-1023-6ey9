@@ -6,7 +6,11 @@ import type {
   DifferenceStatus,
   PersistedCollationState,
   TextUnit,
-  VersionDocument
+  VersionDocument,
+  WorkPackage,
+  WorkPackageInspection,
+  WorkPackageIssue,
+  WorkPackageRestorePlan
 } from '../types';
 
 const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
@@ -168,6 +172,315 @@ function makeRow(
 
 function defaultRules(): ComparisonRules {
   return { ignorePunctuation: true, ignoreVariants: true, candidateWindow: 3 };
+}
+
+const WORKPACKAGE_KIND = 'collation-workpackage';
+const validStatuses: DifferenceStatus[] = ['same', 'changed', 'added', 'removed', 'misaligned'];
+
+/** 工作包比对时消除换行差异，避免 \r\n / \n 造成"同名版本正文不同"的误报 */
+function canonicalText(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .join('\n')
+    .trim();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function firstDifference(expected: string, actual: string) {
+  const a = Array.from(expected);
+  const b = Array.from(actual);
+  let index = 0;
+  while (index < a.length && index < b.length && a[index] === b[index]) index += 1;
+  const clip = (chars: string[], at: number) => chars.slice(Math.max(0, at - 8), at + 8).join('');
+  return {
+    index,
+    expectedSnippet: clip(a, index) || '（结尾）',
+    actualSnippet: clip(b, index) || '（结尾）'
+  };
+}
+
+/**
+ * 校验粘贴进来的工作包并生成恢复计划（纯函数，不改动任何当前状态）。
+ * 错误项会阻止恢复；警告项可恢复。计划中的版本直接采用工作包自带正文，
+ * 本地仅用于检测同名版本正文不一致等冲突。
+ */
+export function inspectWorkPackage(raw: string, localVersions: VersionDocument[]): WorkPackageInspection {
+  const issues: WorkPackageIssue[] = [];
+  const error = (code: string, message: string) => issues.push({ level: 'error', code, message });
+  const warning = (code: string, message: string) => issues.push({ level: 'warning', code, message });
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return {
+      ok: false,
+      issues: [{ level: 'error', code: 'invalid-json', message: `内容不是合法 JSON：${(err as Error).message}` }],
+      summary: { versionCount: 0, rowCount: 0, differenceCount: 0, baseName: '', referenceName: '', reusedCount: 0, createdCount: 0 }
+    };
+  }
+  if (!isRecord(parsed)) {
+    return {
+      ok: false,
+      issues: [{ level: 'error', code: 'invalid-shape', message: '工作包结构不正确：顶层应为对象' }],
+      summary: { versionCount: 0, rowCount: 0, differenceCount: 0, baseName: '', referenceName: '', reusedCount: 0, createdCount: 0 }
+    };
+  }
+
+  // 兼容旧版"JSON 校勘数据"导出
+  if (parsed.kind !== WORKPACKAGE_KIND) {
+    if (isRecord(parsed.left) && isRecord(parsed.right) && Array.isArray(parsed.rows)) {
+      warning('legacy-format', '这是旧版 JSON 校勘数据，仅含底本与参校本两个版本，仍可恢复。');
+      const left = parsed.left as unknown as VersionDocument;
+      const right = parsed.right as unknown as VersionDocument;
+      const versions: VersionDocument[] = [left, right];
+      if (!parsed.leftVersionId && !parsed.rightVersionId) {
+        parsed.leftVersionId = left.id;
+        parsed.rightVersionId = right.id;
+      }
+      parsed.versions = versions;
+      parsed.kind = WORKPACKAGE_KIND;
+    } else {
+      error('unknown-format', '无法识别：缺少工作包标记（collation-workpackage），也不是旧版校勘数据。');
+      return {
+        ok: false,
+        issues,
+        summary: { versionCount: 0, rowCount: 0, differenceCount: 0, baseName: '', referenceName: '', reusedCount: 0, createdCount: 0 }
+      };
+    }
+  }
+
+  // ---- 版本清单 ----
+  if (!Array.isArray(parsed.versions) || !parsed.versions.length) {
+    error('missing-versions', '工作包缺少版本正文清单（versions 为空）。');
+    return {
+      ok: false,
+      issues,
+      summary: { versionCount: 0, rowCount: 0, differenceCount: 0, baseName: '', referenceName: '', reusedCount: 0, createdCount: 0 }
+    };
+  }
+
+  const packageVersions: VersionDocument[] = [];
+  const seenIds = new Set<string>();
+  const seenNames = new Set<string>();
+  parsed.versions.forEach((entry, index) => {
+    const label = `第 ${index + 1} 个版本`;
+    if (!isRecord(entry)) {
+      error('bad-version', `${label}结构不正确。`);
+      return;
+    }
+    if (typeof entry.id !== 'string' || !entry.id) {
+      error('bad-version-id', `${label}缺少版本标识 id。`);
+      return;
+    }
+    if (seenIds.has(entry.id)) {
+      error('duplicate-version-id', `版本标识「${entry.id}」在包内重复，无法可靠恢复对齐引用。`);
+    }
+    seenIds.add(entry.id);
+    if (typeof entry.name !== 'string' || !entry.name.trim()) {
+      error('bad-version-name', `${label}（id：${entry.id}）缺少版本名称。`);
+    } else if (seenNames.has(entry.name)) {
+      error('duplicate-version-name', `版本名称「${entry.name}」在包内重复，无法按名称与本地工作区核对。`);
+    } else {
+      seenNames.add(entry.name);
+    }
+    const text = typeof entry.text === 'string' ? entry.text : '';
+    if (!text.trim()) {
+      error('bad-version-text', `版本「${String(entry.name ?? entry.id)}」缺少正文文本，工作包无法用于重新粘贴恢复。`);
+      return;
+    }
+    let units: TextUnit[];
+    if (Array.isArray(entry.units) && entry.units.length) {
+      const wellFormed = entry.units.every(
+        (unit) =>
+          isRecord(unit) &&
+          typeof unit.id === 'string' &&
+          typeof unit.text === 'string'
+      );
+      if (!wellFormed) {
+        warning('bad-units', `版本「${String(entry.name)}」的句段数据不完整，已按正文重新分段。`);
+        units = splitIntoUnits(text, entry.id);
+      } else {
+        units = entry.units as unknown as TextUnit[];
+      }
+    } else {
+      warning('missing-units', `版本「${String(entry.name)}」缺少句段数据，已按正文重新分段。`);
+      units = splitIntoUnits(text, entry.id);
+    }
+    packageVersions.push({
+      id: entry.id,
+      name: typeof entry.name === 'string' ? entry.name : entry.id,
+      source: typeof entry.source === 'string' ? entry.source : '',
+      text,
+      units,
+      createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : new Date().toISOString()
+    });
+  });
+
+  const byId = new Map(packageVersions.map((item) => [item.id, item]));
+  const byName = new Map(packageVersions.map((item) => [item.name, item]));
+
+  // ---- 底本 / 参校组合 ----
+  const leftId = typeof parsed.leftVersionId === 'string' ? parsed.leftVersionId : '';
+  const rightId = typeof parsed.rightVersionId === 'string' ? parsed.rightVersionId : '';
+  if (!leftId) error('missing-base-id', '工作包未记录当前底本（leftVersionId 为空）。');
+  else if (!byId.has(leftId)) error('base-missing', `底本缺失：工作包指定的底本「${leftId}」不在版本正文清单中。`);
+  if (!rightId) warning('missing-reference-id', '工作包未记录参校本（rightVersionId 为空），恢复后可手动选择。');
+  else if (!byId.has(rightId)) error('reference-missing', `参校本缺失：指定的参校本「${rightId}」不在版本正文清单中。`);
+
+  // ---- 比较规则 ----
+  let rules: ComparisonRules = defaultRules();
+  if (isRecord(parsed.rules)) {
+    rules = {
+      ignorePunctuation: typeof parsed.rules.ignorePunctuation === 'boolean' ? parsed.rules.ignorePunctuation : true,
+      ignoreVariants: typeof parsed.rules.ignoreVariants === 'boolean' ? parsed.rules.ignoreVariants : true,
+      candidateWindow: typeof parsed.rules.candidateWindow === 'number' ? parsed.rules.candidateWindow : 3
+    };
+    if (typeof parsed.rules.ignorePunctuation !== 'boolean' || typeof parsed.rules.ignoreVariants !== 'boolean') {
+      warning('rules-partial', '比较规则字段不完整，已用默认规则补齐。');
+    }
+  } else {
+    warning('rules-missing', '工作包缺少比较规则，已使用默认规则（忽略标点、忽略异体字）。');
+  }
+
+  // ---- 对齐行 ----
+  const unitOwners = new Map<string, string>();
+  packageVersions.forEach((version) => {
+    version.units.forEach((unit) => unitOwners.set(unit.id, version.id));
+  });
+
+  const rows: AlignmentRow[] = [];
+  if (!Array.isArray(parsed.rows)) {
+    error('missing-rows', '工作包缺少对齐行数据（rows 不是数组）。');
+  } else if (!parsed.rows.length) {
+    warning('empty-rows', '工作包中的对齐行为空，恢复后需要重新执行自动对齐。');
+  } else {
+    const rowIds = new Set<string>();
+    let regeneratedRows = 0;
+    let sideMismatch = false;
+    parsed.rows.forEach((entry, index) => {
+      const label = `第 ${index + 1} 行`;
+      if (!isRecord(entry)) {
+        error('bad-row', `${label}结构不正确。`);
+        return;
+      }
+      const status = entry.status as DifferenceStatus;
+      if (!validStatuses.includes(status)) {
+        error('bad-row-status', `${label}的状态「${String(entry.status)}」无法识别。`);
+      }
+      const checkSide = (side: 'left' | 'right') => {
+        const unit = entry[side];
+        if (unit == null) return undefined;
+        if (!isRecord(unit) || typeof unit.id !== 'string') {
+          error('bad-row-unit', `${label}的${side === 'left' ? '底本' : '参校本'}句段结构不正确。`);
+          return undefined;
+        }
+        const owner = unitOwners.get(unit.id);
+        if (!owner) {
+          error(
+            'row-unit-missing',
+            `${label}引用的${side === 'left' ? '底本' : '参校本'}句段「${unit.id}」在工作包版本正文中找不到，对齐关系无法恢复。`
+          );
+        } else if (side === 'left' && leftId && owner !== leftId) {
+          sideMismatch = true;
+        } else if (side === 'right' && rightId && owner !== rightId) {
+          sideMismatch = true;
+        }
+        return unit as unknown as TextUnit;
+      };
+      const left = checkSide('left');
+      const right = checkSide('right');
+      if (!left && !right) error('empty-row', `${label}底本与参校本两侧都为空，无法构成对齐行。`);
+
+      let id = typeof entry.id === 'string' && entry.id ? entry.id : '';
+      if (!id) {
+        id = `restored-row-${Date.now().toString(36)}-${index}`;
+        regeneratedRows += 1;
+      } else if (rowIds.has(id)) {
+        error('duplicate-row-id', `对齐行标识「${id}」在包内重复。`);
+      }
+      rowIds.add(id);
+
+      rows.push({
+        id,
+        left,
+        right,
+        status: validStatuses.includes(status) ? status : 'misaligned',
+        similarity: typeof entry.similarity === 'number' ? entry.similarity : 0,
+        note: typeof entry.note === 'string' ? entry.note : '',
+        source: typeof entry.source === 'string' ? entry.source : '',
+        accepted: Boolean(entry.accepted),
+        manuallyAdjusted: Boolean(entry.manuallyAdjusted)
+      });
+    });
+    if (regeneratedRows) warning('row-id-regenerated', `有 ${regeneratedRows} 条对齐行缺少标识，已重新生成。`);
+    if (sideMismatch) warning('row-side-mismatch', '部分对齐行引用的句段不属于当前底本/参校组合，请逐行核对配对关系。');
+  }
+
+  // ---- 与本地工作区核对：同名版本正文不同、id 冲突 ----
+  const localByName = new Map(localVersions.map((item) => [item.name, item]));
+  const localById = new Map(localVersions.map((item) => [item.id, item]));
+  packageVersions.forEach((candidate) => {
+    const sameName = localByName.get(candidate.name);
+    if (sameName && canonicalText(sameName.text) !== canonicalText(candidate.text)) {
+      const diff = firstDifference(canonicalText(sameName.text), canonicalText(candidate.text));
+      error(
+        'version-text-mismatch',
+        `同名版本正文不同：「${candidate.name}」在第 ${diff.index + 1} 字处对不上。` +
+          `本地为「…${diff.expectedSnippet}…」，工作包为「…${diff.actualSnippet}…」。`
+      );
+    }
+    const sameId = localById.get(candidate.id);
+    if (sameId && sameId.name !== candidate.name) {
+      error(
+        'version-id-collision',
+        `版本标识冲突：本地「${sameId.name}」与工作包「${candidate.name}」共用 id ${candidate.id}，恢复会串用正文。`
+      );
+    }
+  });
+
+  const baseName = byId.get(leftId)?.name ?? '';
+  const referenceName = byId.get(rightId)?.name ?? '';
+  const reusableIds = new Set(
+    packageVersions.filter((candidate) => localByName.has(candidate.name)).map((item) => item.id)
+  );
+
+  const summary = {
+    versionCount: packageVersions.length,
+    rowCount: rows.length,
+    differenceCount: rows.filter((row) => row.status !== 'same').length,
+    baseName,
+    referenceName,
+    reusedCount: reusableIds.size,
+    createdCount: packageVersions.length - reusableIds.size
+  };
+
+  const hasError = issues.some((issue) => issue.level === 'error');
+  let plan: WorkPackageRestorePlan | undefined;
+  if (!hasError) {
+    let selectedRowId = typeof parsed.selectedRowId === 'string' ? parsed.selectedRowId : '';
+    if (selectedRowId && !rows.some((row) => row.id === selectedRowId)) {
+      warning('selection-lost', '工作包记录的当前行已不存在，恢复后定位到第一处差异。');
+      selectedRowId = '';
+    }
+    plan = {
+      versions: clone(packageVersions),
+      leftVersionId: leftId,
+      rightVersionId: rightId,
+      rules,
+      rows: clone(rows),
+      selectedRowId: selectedRowId || rows.find((row) => row.status !== 'same')?.id || rows[0]?.id || '',
+      reusedVersionIds: packageVersions.filter((item) => reusableIds.has(item.id)).map((item) => item.id),
+      createdVersionIds: packageVersions.filter((item) => !reusableIds.has(item.id)).map((item) => item.id)
+    };
+  }
+
+  return { ok: !hasError, issues, summary, plan };
 }
 
 export function useCollation() {
@@ -413,6 +726,43 @@ export function useCollation() {
     );
   }
 
+  /** 生成可粘贴恢复的工作包：版本正文 + 底本参校组合 + 比较规则 + 全部对齐行 */
+  function exportWorkPackage() {
+    const pack: WorkPackage = {
+      kind: 'collation-workpackage',
+      appVersion: 1,
+      exportedAt: new Date().toISOString(),
+      versions: clone(versions.value),
+      leftVersionId: leftVersionId.value,
+      rightVersionId: rightVersionId.value,
+      rules: clone(rules.value),
+      rows: clone(rows.value),
+      selectedRowId: selectedRowId.value
+    };
+    return JSON.stringify(pack, null, 2);
+  }
+
+  /** 仅校验并生成恢复计划，不触碰当前工作区 */
+  function inspectPackage(raw: string): WorkPackageInspection {
+    return inspectWorkPackage(raw, versions.value);
+  }
+
+  /** 校验通过后整体恢复；恢复动作进入撤销历史，可随时撤回原工作区 */
+  function restoreFromPackage(plan: WorkPackageRestorePlan) {
+    commit(
+      `已从工作包恢复：${plan.versions.length} 个版本、${plan.rows.length} 条对齐行（可撤销）`,
+      () => {
+        versions.value = clone(plan.versions);
+        leftVersionId.value = plan.leftVersionId;
+        rightVersionId.value = plan.rightVersionId;
+        rules.value = clone(plan.rules);
+        rows.value = clone(plan.rows);
+        selectedRowId.value = plan.selectedRowId;
+        selectedRowIds.value = [];
+      }
+    );
+  }
+
   onMounted(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -470,6 +820,9 @@ export function useCollation() {
     redo,
     exportMarkdown,
     exportJson,
+    exportWorkPackage,
+    inspectPackage,
+    restoreFromPackage,
     commit
   };
 }

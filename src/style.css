@@ -208,6 +208,22 @@ textarea {
   background: #f7f8fa;
 }
 
+.package-textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.issue-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.issue-list li {
+  margin: 2px 0;
+  line-height: 1.6;
+}
+
 @media (max-width: 1100px) {
   .main-layout {
     display: block !important;
